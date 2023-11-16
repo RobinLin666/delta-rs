@@ -270,31 +270,55 @@ mod imp {
         let to_path = String::from(to);
 
         tokio::task::spawn_blocking(move || {
-            std::fs::hard_link(&from_path, &to_path).map_err(|err| {
-                if err.kind() == std::io::ErrorKind::AlreadyExists {
-                    LocalFileSystemError::AlreadyExists {
-                        path: to_path,
-                        source: Box::new(err),
-                    }
-                } else if err.kind() == std::io::ErrorKind::NotFound {
-                    LocalFileSystemError::NotFound {
-                        path: from_path.clone(),
-                        source: Box::new(err),
-                    }
-                } else {
-                    LocalFileSystemError::Generic {
-                        store: STORE_NAME,
-                        source: Box::new(err),
-                    }
+            match std::fs::hard_link(&from_path, &to_path) {
+                Ok(_) => {
+                    std::fs::remove_file(from_path).map_err(|err| {
+                        LocalFileSystemError::Generic {
+                            store: STORE_NAME,
+                            source: Box::new(err),
+                        }
+                    })?;
+                    Ok(())
                 }
-            })?;
-
-            std::fs::remove_file(from_path).map_err(|err| LocalFileSystemError::Generic {
-                store: STORE_NAME,
-                source: Box::new(err),
-            })?;
-
-            Ok(())
+                Err(source) => match source.kind() {
+                    std::io::ErrorKind::Unsupported => {
+                        // If the filesystem(such as blobfuse,goofys,s3fs) does not support hard links, fall back to rename
+                        if std::fs::metadata(&to_path).is_ok() {
+                            return Err(LocalFileSystemError::AlreadyExists {
+                                path: to_path,
+                                source: Box::new(source),
+                            });
+                        } else {
+                            std::fs::rename(&from_path, &to_path).map_err(|err| {
+                                if err.kind() == std::io::ErrorKind::NotFound {
+                                    LocalFileSystemError::NotFound {
+                                        path: from_path.clone(),
+                                        source: Box::new(err),
+                                    }
+                                } else {
+                                    LocalFileSystemError::Generic {
+                                        store: STORE_NAME,
+                                        source: Box::new(err),
+                                    }
+                                }
+                            })?;
+                            Ok(())
+                        }
+                    }
+                    std::io::ErrorKind::AlreadyExists => Err(LocalFileSystemError::AlreadyExists {
+                        path: to_path,
+                        source: Box::new(source),
+                    }),
+                    std::io::ErrorKind::NotFound => Err(LocalFileSystemError::NotFound {
+                        path: from_path.clone(),
+                        source: Box::new(source),
+                    }),
+                    _ => Err(LocalFileSystemError::Generic {
+                        store: STORE_NAME,
+                        source: Box::new(source),
+                    }),
+                },
+            }
         })
         .await
         .unwrap()
