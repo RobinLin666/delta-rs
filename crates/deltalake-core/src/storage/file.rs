@@ -2,6 +2,8 @@
 //!
 //! The local file storage backend is multi-writer safe.
 
+use super::utils::str_is_truthy;
+use crate::table::builder::file_storage_options;
 use bytes::Bytes;
 use futures::stream::BoxStream;
 use object_store::{
@@ -282,27 +284,37 @@ mod imp {
                 }
                 Err(source) => match source.kind() {
                     std::io::ErrorKind::Unsupported => {
-                        // If the filesystem(such as blobfuse,goofys,s3fs) does not support hard links, fall back to rename
-                        if std::fs::metadata(&to_path).is_ok() {
-                            return Err(LocalFileSystemError::AlreadyExists {
-                                path: to_path,
-                                source: Box::new(source),
-                            });
+                        let allow_unsafe_rename = std::env::var(file_storage_options::FILE_ALLOW_UNSAFE_RENAME)
+                            .map(|val| str_is_truthy(&val))
+                            .unwrap_or(false);
+                        if allow_unsafe_rename {
+                            // If the filesystem(such as blobfuse,goofys,s3fs) does not support hard links, fall back to rename
+                            if std::fs::metadata(&to_path).is_ok() {
+                                Err(LocalFileSystemError::AlreadyExists {
+                                    path: to_path,
+                                    source: Box::new(source),
+                                })
+                            } else {
+                                std::fs::rename(&from_path, &to_path).map_err(|err| {
+                                    if err.kind() == std::io::ErrorKind::NotFound {
+                                        LocalFileSystemError::NotFound {
+                                            path: from_path.clone(),
+                                            source: Box::new(err),
+                                        }
+                                    } else {
+                                        LocalFileSystemError::Generic {
+                                            store: STORE_NAME,
+                                            source: Box::new(err),
+                                        }
+                                    }
+                                })?;
+                                Ok(())
+                            }
                         } else {
-                            std::fs::rename(&from_path, &to_path).map_err(|err| {
-                                if err.kind() == std::io::ErrorKind::NotFound {
-                                    LocalFileSystemError::NotFound {
-                                        path: from_path.clone(),
-                                        source: Box::new(err),
-                                    }
-                                } else {
-                                    LocalFileSystemError::Generic {
-                                        store: STORE_NAME,
-                                        source: Box::new(err),
-                                    }
-                                }
-                            })?;
-                            Ok(())
+                            Err(LocalFileSystemError::Generic {
+                                store: STORE_NAME,
+                                source: Box::new(source),
+                            })
                         }
                     }
                     std::io::ErrorKind::AlreadyExists => Err(LocalFileSystemError::AlreadyExists {
