@@ -377,12 +377,19 @@ pub mod s3_storage_options {
     ];
 }
 
-/// Storage options keys to use when using [crate::storage::file::FileStorageBackend].
-/// The key will be used only when setting it as an environment variable for now.
+/// Storage option keys to use when creating [crate::storage::file::FileStorageOptions].
+/// The same key should be used whether passing a key in the hashmap or setting it as an environment variable.
 pub mod file_storage_options {
     /// If set to "true", allows creating commits without concurrent writer protection.
     /// Only safe if there is one writer to a given table.
     pub const FILE_ALLOW_UNSAFE_RENAME: &str = "FILE_ALLOW_UNSAFE_RENAME";
+
+    /// The list of option keys owned by the File module.
+    /// Option keys not contained in this list will be added to the `extra_opts`
+    /// field of [crate::storage::file::FileStorageOptions].
+    pub const FILE_OPTS: &[&str] = &[
+        FILE_ALLOW_UNSAFE_RENAME,
+    ];
 }
 
 #[allow(dead_code)]

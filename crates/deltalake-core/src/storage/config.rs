@@ -9,7 +9,7 @@ use object_store::{parse_url_opts, DynObjectStore, Error as ObjectStoreError, Ob
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use super::file::FileStorageBackend;
+use super::file::{FileStorageBackend, FileStorageOptions};
 use super::utils::str_is_truthy;
 use crate::errors::{DeltaResult, DeltaTableError};
 use crate::logstore::default_logstore::DefaultLogStore;
@@ -248,7 +248,7 @@ pub fn configure_store(
             let path = url
                 .to_file_path()
                 .map_err(|_| DeltaTableError::InvalidTableLocation(url.to_string()))?;
-            Ok(Arc::new(FileStorageBackend::try_new(path)?))
+            Ok(Arc::new(FileStorageBackend::try_new(path, FileStorageOptions::from_map(&options.0))?))
         }
         ObjectStoreScheme::Memory => url_prefix_handler(InMemory::new(), Path::parse(url.path())?),
         #[cfg(any(feature = "s3", feature = "s3-native-tls"))]

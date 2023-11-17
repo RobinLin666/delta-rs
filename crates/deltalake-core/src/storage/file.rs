@@ -3,7 +3,7 @@
 //! The local file storage backend is multi-writer safe.
 
 use super::utils::str_is_truthy;
-use crate::table::builder::file_storage_options;
+use crate::table::builder::{file_storage_options, str_option};
 use bytes::Bytes;
 use futures::stream::BoxStream;
 use object_store::{
@@ -11,6 +11,7 @@ use object_store::{
     GetResult, ListResult, MultipartId, ObjectMeta as ObjStoreObjectMeta, ObjectStore,
     Result as ObjectStoreResult,
 };
+use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 use tokio::io::AsyncWrite;
@@ -105,6 +106,36 @@ impl From<LocalFileSystemError> for ObjectStoreError {
     }
 }
 
+/// Options used to configure the FileStorageBackend.
+///
+/// Available options are described in [file_storage_options].
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(missing_docs)]
+pub struct FileStorageOptions {
+    pub allow_unsafe_rename: bool,
+}
+
+impl FileStorageOptions {
+    /// Creates an instance of FileStorageOptions from the given HashMap.
+    pub fn from_map(options: &HashMap<String, String>) -> FileStorageOptions {
+        let allow_unsafe_rename =
+            str_option(options, file_storage_options::FILE_ALLOW_UNSAFE_RENAME)
+                .map(|val| str_is_truthy(&val))
+                .unwrap_or(false);
+
+        Self {
+            allow_unsafe_rename,
+        }
+    }
+}
+
+impl Default for FileStorageOptions {
+    /// Creates an instance of FileStorageOptions from environment variables.
+    fn default() -> FileStorageOptions {
+        Self::from_map(&HashMap::new())
+    }
+}
+
 /// Multi-writer support for different platforms:
 ///
 /// * Modern Linux kernels are well supported. However because Linux implementation leverages
@@ -121,14 +152,20 @@ impl From<LocalFileSystemError> for ObjectStoreError {
 pub struct FileStorageBackend {
     inner: Arc<LocalFileSystem>,
     root_url: Arc<Url>,
+    /// Whether allowed to performance rename_if_not_exist as rename
+    allow_unsafe_rename: bool,
 }
 
 impl FileStorageBackend {
     /// Creates a new FileStorageBackend.
-    pub fn try_new(path: impl AsRef<std::path::Path>) -> ObjectStoreResult<Self> {
+    pub fn try_new(
+        path: impl AsRef<std::path::Path>,
+        options: FileStorageOptions,
+    ) -> ObjectStoreResult<Self> {
         Ok(Self {
             root_url: Arc::new(Self::path_to_root_url(path.as_ref())?),
             inner: Arc::new(LocalFileSystem::new_with_prefix(path)?),
+            allow_unsafe_rename: options.allow_unsafe_rename,
         })
     }
 
@@ -233,7 +270,11 @@ impl ObjectStore for FileStorageBackend {
     ) -> ObjectStoreResult<()> {
         let path_from = self.path_to_filesystem(from);
         let path_to = self.path_to_filesystem(to);
-        Ok(rename_noreplace(path_from.as_ref(), path_to.as_ref()).await?)
+        if self.allow_unsafe_rename {
+            Ok(regular_rename(path_from.as_ref(), path_to.as_ref()).await?)
+        } else {
+            Ok(rename_noreplace(path_from.as_ref(), path_to.as_ref()).await?)
+        }
     }
 
     async fn put_multipart(
@@ -259,6 +300,15 @@ async fn rename_noreplace(from: &str, to: &str) -> Result<(), LocalFileSystemErr
     imp::rename_noreplace(from, to).await
 }
 
+/// Regular renames `from` to `to`.
+/// `from` has to exist, but `to` is not, otherwise the operation will fail.
+/// If the filesystem(such as blobfuse,goofys,s3fs) does not support hard links,
+/// you can set the FILE_ALLOW_UNSAFE_RENAME to true to use regular rename.
+#[inline]
+async fn regular_rename(from: &str, to: &str) -> Result<(), LocalFileSystemError> {
+    imp::regular_rename(from, to).await
+}
+
 // Generic implementation (Requires 2 system calls)
 #[cfg(not(any(
     all(target_os = "linux", target_env = "gnu", glibc_renameat2),
@@ -270,46 +320,54 @@ mod imp {
     pub(super) async fn rename_noreplace(from: &str, to: &str) -> Result<(), LocalFileSystemError> {
         let from_path = String::from(from);
         let to_path = String::from(to);
-        let allow_unsafe_rename = std::env::var(file_storage_options::FILE_ALLOW_UNSAFE_RENAME)
-            .map(|val| str_is_truthy(&val))
-            .unwrap_or(false);
 
         tokio::task::spawn_blocking(move || {
-            if allow_unsafe_rename {
-                // If the filesystem(such as blobfuse,goofys,s3fs) does not support hard links,
-                // you can set the environment variable FILE_ALLOW_UNSAFE_RENAME to true.
-                if std::fs::metadata(&to_path).is_ok() {
-                    Err(LocalFileSystemError::AlreadyExists {
+            std::fs::hard_link(&from_path, &to_path).map_err(|err| {
+                if err.kind() == std::io::ErrorKind::AlreadyExists {
+                    LocalFileSystemError::AlreadyExists {
                         path: to_path,
-                        source: Box::new(std::io::Error::new(
-                            std::io::ErrorKind::AlreadyExists,
-                            "Already exists",
-                        )),
-                    })
+                        source: Box::new(err),
+                    }
+                } else if err.kind() == std::io::ErrorKind::NotFound {
+                    LocalFileSystemError::NotFound {
+                        path: from_path.clone(),
+                        source: Box::new(err),
+                    }
                 } else {
-                    std::fs::rename(&from_path, &to_path).map_err(|err| {
-                        if err.kind() == std::io::ErrorKind::NotFound {
-                            LocalFileSystemError::NotFound {
-                                path: from_path.clone(),
-                                source: Box::new(err),
-                            }
-                        } else {
-                            LocalFileSystemError::Generic {
-                                store: STORE_NAME,
-                                source: Box::new(err),
-                            }
-                        }
-                    })?;
-                    Ok(())
+                    LocalFileSystemError::Generic {
+                        store: STORE_NAME,
+                        source: Box::new(err),
+                    }
                 }
+            })?;
+
+            std::fs::remove_file(from_path).map_err(|err| LocalFileSystemError::Generic {
+                store: STORE_NAME,
+                source: Box::new(err),
+            })?;
+
+            Ok(())
+        })
+        .await
+        .unwrap()
+    }
+
+    pub(super) async fn regular_rename(from: &str, to: &str) -> Result<(), LocalFileSystemError> {
+        let from_path = String::from(from);
+        let to_path = String::from(to);
+
+        tokio::task::spawn_blocking(move || {
+            if std::fs::metadata(&to_path).is_ok() {
+                Err(LocalFileSystemError::AlreadyExists {
+                    path: to_path,
+                    source: Box::new(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        "Already exists",
+                    )),
+                })
             } else {
-                std::fs::hard_link(&from_path, &to_path).map_err(|err| {
-                    if err.kind() == std::io::ErrorKind::AlreadyExists {
-                        LocalFileSystemError::AlreadyExists {
-                            path: to_path,
-                            source: Box::new(err),
-                        }
-                    } else if err.kind() == std::io::ErrorKind::NotFound {
+                std::fs::rename(&from_path, &to_path).map_err(|err| {
+                    if err.kind() == std::io::ErrorKind::NotFound {
                         LocalFileSystemError::NotFound {
                             path: from_path.clone(),
                             source: Box::new(err),
@@ -321,12 +379,6 @@ mod imp {
                         }
                     }
                 })?;
-
-                std::fs::remove_file(from_path).map_err(|err| LocalFileSystemError::Generic {
-                    store: STORE_NAME,
-                    source: Box::new(err),
-                })?;
-
                 Ok(())
             }
         })
