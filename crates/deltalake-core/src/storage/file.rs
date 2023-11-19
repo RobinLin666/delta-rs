@@ -444,6 +444,10 @@ mod imp {
         }
     }
 
+    pub(super) async fn regular_rename(from: &str, to: &str) -> Result<(), LocalFileSystemError> {
+        rename_noreplace(from, to).await
+    }
+
     #[allow(unused_variables)]
     unsafe fn platform_specific_rename(from: *const libc::c_char, to: *const libc::c_char) -> i32 {
         cfg_if::cfg_if! {

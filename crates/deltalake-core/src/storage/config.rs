@@ -248,7 +248,10 @@ pub fn configure_store(
             let path = url
                 .to_file_path()
                 .map_err(|_| DeltaTableError::InvalidTableLocation(url.to_string()))?;
-            Ok(Arc::new(FileStorageBackend::try_new(path, FileStorageOptions::from_map(&options.0))?))
+            Ok(Arc::new(FileStorageBackend::try_new(
+                path,
+                FileStorageOptions::from_map(&options.0),
+            )?))
         }
         ObjectStoreScheme::Memory => url_prefix_handler(InMemory::new(), Path::parse(url.path())?),
         #[cfg(any(feature = "s3", feature = "s3-native-tls"))]

@@ -387,9 +387,7 @@ pub mod file_storage_options {
     /// The list of option keys owned by the File module.
     /// Option keys not contained in this list will be added to the `extra_opts`
     /// field of [crate::storage::file::FileStorageOptions].
-    pub const FILE_OPTS: &[&str] = &[
-        FILE_ALLOW_UNSAFE_RENAME,
-    ];
+    pub const FILE_OPTS: &[&str] = &[FILE_ALLOW_UNSAFE_RENAME];
 }
 
 #[allow(dead_code)]
