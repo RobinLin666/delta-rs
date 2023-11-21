@@ -138,7 +138,9 @@ def test_local_path(tmp_path: pathlib.Path, sample_data: pa.Table, monkeypatch):
     assert table == sample_data
 
 
-def test_local_path_with_unsafe_rename(tmp_path: pathlib.Path, sample_data: pa.Table, monkeypatch):
+def test_local_path_with_unsafe_rename(
+    tmp_path: pathlib.Path, sample_data: pa.Table, monkeypatch
+):
     monkeypatch.chdir(tmp_path)  # Make tmp_path the working directory
     (tmp_path / "path/to/table").mkdir(parents=True)
 
