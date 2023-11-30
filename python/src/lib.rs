@@ -27,6 +27,7 @@ use deltalake::datafusion::prelude::SessionContext;
 use deltalake::delta_datafusion::DeltaDataChecker;
 use deltalake::errors::DeltaTableError;
 use deltalake::kernel::{Action, Add, Invariant, Metadata, Remove, StructType};
+use deltalake::operations::convert_to_delta::{ConvertToDeltaBuilder, PartitionStrategy};
 use deltalake::operations::delete::DeleteBuilder;
 use deltalake::operations::filesystem_check::FileSystemCheckBuilder;
 use deltalake::operations::merge::MergeBuilder;
@@ -43,6 +44,7 @@ use deltalake::DeltaTableBuilder;
 use pyo3::exceptions::{PyIOError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyFrozenSet, PyType};
+use serde_json::{Map, Value};
 
 use crate::error::DeltaProtocolError;
 use crate::error::PythonError;
@@ -132,9 +134,7 @@ impl RawDeltaTable {
         catalog_options: Option<HashMap<String, String>>,
     ) -> PyResult<String> {
         let data_catalog = deltalake::data_catalog::get_data_catalog(data_catalog, catalog_options)
-            .map_err(|_| {
-                PyValueError::new_err(format!("Catalog '{}' not available.", data_catalog))
-            })?;
+            .map_err(|e| PyValueError::new_err(format!("{}", e)))?;
         let table_uri = rt()?
             .block_on(data_catalog.get_table_storage_location(
                 data_catalog_id,
@@ -758,7 +758,8 @@ impl RawDeltaTable {
         schema: PyArrowType<ArrowSchema>,
         partitions_filters: Option<Vec<(&str, &str, PartitionFilterValue)>>,
     ) -> PyResult<()> {
-        let mode = save_mode_from_str(mode)?;
+        let mode = mode.parse().map_err(PythonError::from)?;
+
         let schema: StructType = (&schema.0).try_into().map_err(PythonError::from)?;
 
         let existing_schema = self._table.get_schema().map_err(PythonError::from)?;
@@ -1088,16 +1089,6 @@ fn batch_distinct(batch: PyArrowType<RecordBatch>) -> PyResult<PyArrowType<Recor
     ))
 }
 
-fn save_mode_from_str(value: &str) -> PyResult<SaveMode> {
-    match value {
-        "append" => Ok(SaveMode::Append),
-        "overwrite" => Ok(SaveMode::Overwrite),
-        "error" => Ok(SaveMode::ErrorIfExists),
-        "ignore" => Ok(SaveMode::Ignore),
-        _ => Err(PyValueError::new_err("Invalid save mode")),
-    }
-}
-
 fn current_timestamp() -> i64 {
     let start = SystemTime::now();
     let since_the_epoch = start
@@ -1133,6 +1124,64 @@ impl From<&PyAddAction> for Add {
             default_row_commit_version: None,
         }
     }
+}
+
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+fn write_to_deltalake(
+    table_uri: String,
+    data: PyArrowType<ArrowArrayStreamReader>,
+    mode: String,
+    max_rows_per_group: i64,
+    overwrite_schema: bool,
+    partition_by: Option<Vec<String>>,
+    predicate: Option<String>,
+    name: Option<String>,
+    description: Option<String>,
+    configuration: Option<HashMap<String, Option<String>>>,
+    storage_options: Option<HashMap<String, String>>,
+) -> PyResult<()> {
+    let batches = data.0.map(|batch| batch.unwrap()).collect::<Vec<_>>();
+    let save_mode = mode.parse().map_err(PythonError::from)?;
+
+    let options = storage_options.clone().unwrap_or_default();
+    let table = rt()?
+        .block_on(DeltaOps::try_from_uri_with_storage_options(
+            &table_uri, options,
+        ))
+        .map_err(PythonError::from)?;
+
+    let mut builder = table
+        .write(batches)
+        .with_save_mode(save_mode)
+        .with_overwrite_schema(overwrite_schema)
+        .with_write_batch_size(max_rows_per_group as usize);
+
+    if let Some(partition_columns) = partition_by {
+        builder = builder.with_partition_columns(partition_columns);
+    }
+
+    if let Some(name) = &name {
+        builder = builder.with_table_name(name);
+    };
+
+    if let Some(description) = &description {
+        builder = builder.with_description(description);
+    };
+
+    if let Some(predicate) = &predicate {
+        builder = builder.with_replace_where(predicate);
+    };
+
+    if let Some(config) = configuration {
+        builder = builder.with_configuration(config);
+    };
+
+    rt()?
+        .block_on(builder.into_future())
+        .map_err(PythonError::from)?;
+
+    Ok(())
 }
 
 #[pyfunction]
@@ -1177,6 +1226,58 @@ fn write_new_deltalake(
         .block_on(builder.into_future())
         .map_err(PythonError::from)?;
 
+    Ok(())
+}
+
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+fn convert_to_deltalake(
+    uri: String,
+    partition_schema: Option<PyArrowType<ArrowSchema>>,
+    partition_strategy: Option<String>,
+    name: Option<String>,
+    description: Option<String>,
+    configuration: Option<HashMap<String, Option<String>>>,
+    storage_options: Option<HashMap<String, String>>,
+    custom_metadata: Option<HashMap<String, String>>,
+) -> PyResult<()> {
+    let mut builder = ConvertToDeltaBuilder::new().with_location(uri);
+
+    if let Some(part_schema) = partition_schema {
+        let schema: StructType = (&part_schema.0).try_into().map_err(PythonError::from)?;
+        builder = builder.with_partition_schema(schema.fields().clone());
+    }
+
+    if let Some(partition_strategy) = &partition_strategy {
+        let strategy: PartitionStrategy = partition_strategy.parse().map_err(PythonError::from)?;
+        builder = builder.with_partition_strategy(strategy);
+    }
+
+    if let Some(name) = &name {
+        builder = builder.with_table_name(name);
+    }
+
+    if let Some(description) = &description {
+        builder = builder.with_comment(description);
+    }
+
+    if let Some(config) = configuration {
+        builder = builder.with_configuration(config);
+    };
+
+    if let Some(strg_options) = storage_options {
+        builder = builder.with_storage_options(strg_options);
+    };
+
+    if let Some(metadata) = custom_metadata {
+        let json_metadata: Map<String, Value> =
+            metadata.into_iter().map(|(k, v)| (k, v.into())).collect();
+        builder = builder.with_metadata(json_metadata);
+    };
+
+    rt()?
+        .block_on(builder.into_future())
+        .map_err(PythonError::from)?;
     Ok(())
 }
 
@@ -1225,6 +1326,8 @@ fn _internal(py: Python, m: &PyModule) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_function(pyo3::wrap_pyfunction!(rust_core_version, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(write_new_deltalake, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(write_to_deltalake, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(convert_to_deltalake, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(batch_distinct, m)?)?;
     m.add_class::<RawDeltaTable>()?;
     m.add_class::<RawDeltaTableMetaData>()?;

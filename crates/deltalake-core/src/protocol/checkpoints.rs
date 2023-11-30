@@ -18,7 +18,7 @@ use regex::Regex;
 use serde_json::Value;
 
 use super::{time_utils, ProtocolError};
-use crate::kernel::actions::arrow::delta_log_schema_for_table;
+use crate::kernel::arrow::delta_log_schema_for_table;
 use crate::kernel::{
     Action, Add as AddAction, DataType, Metadata, PrimitiveType, Protocol, StructField, StructType,
     Txn,
@@ -468,22 +468,19 @@ fn apply_stats_conversion(
     data_type: &DataType,
 ) {
     if path.len() == 1 {
-        match data_type {
-            DataType::Primitive(PrimitiveType::Timestamp) => {
-                let v = context.get_mut(&path[0]);
+        if let DataType::Primitive(PrimitiveType::Timestamp) = data_type {
+            let v = context.get_mut(&path[0]);
 
-                if let Some(v) = v {
-                    let ts = v
-                        .as_str()
-                        .and_then(|s| time_utils::timestamp_micros_from_stats_string(s).ok())
-                        .map(|n| Value::Number(serde_json::Number::from(n)));
+            if let Some(v) = v {
+                let ts = v
+                    .as_str()
+                    .and_then(|s| time_utils::timestamp_micros_from_stats_string(s).ok())
+                    .map(|n| Value::Number(serde_json::Number::from(n)));
 
-                    if let Some(ts) = ts {
-                        *v = ts;
-                    }
+                if let Some(ts) = ts {
+                    *v = ts;
                 }
             }
-            _ => { /* noop */ }
         }
     } else {
         let next_context = context.get_mut(&path[0]).and_then(|v| v.as_object_mut());

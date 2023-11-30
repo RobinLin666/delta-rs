@@ -140,6 +140,29 @@ def write_new_deltalake(
     configuration: Optional[Mapping[str, Optional[str]]],
     storage_options: Optional[Dict[str, str]],
 ) -> None: ...
+def write_to_deltalake(
+    table_uri: str,
+    data: pyarrow.RecordBatchReader,
+    partition_by: Optional[List[str]],
+    mode: str,
+    max_rows_per_group: int,
+    overwrite_schema: bool,
+    predicate: Optional[str],
+    name: Optional[str],
+    description: Optional[str],
+    configuration: Optional[Mapping[str, Optional[str]]],
+    storage_options: Optional[Dict[str, str]],
+) -> None: ...
+def convert_to_deltalake(
+    uri: str,
+    partition_by: Optional[pyarrow.Schema],
+    partition_strategy: Optional[Literal["hive"]],
+    name: Optional[str],
+    description: Optional[str],
+    configuration: Optional[Mapping[str, Optional[str]]],
+    storage_options: Optional[Dict[str, str]],
+    custom_metadata: Optional[Dict[str, str]],
+) -> None: ...
 def batch_distinct(batch: pyarrow.RecordBatch) -> pyarrow.RecordBatch: ...
 
 # Can't implement inheritance (see note in src/schema.rs), so this is next
