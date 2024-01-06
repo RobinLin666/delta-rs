@@ -13,6 +13,7 @@ pub mod utils;
 
 use crate::{DeltaResult, DeltaTableError};
 
+use file::{FileStorageBackend, FileStorageOptions};
 pub use object_store;
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
@@ -57,10 +58,21 @@ impl ObjectStoreFactory for DefaultObjectStoreFactory {
                 Ok((url_prefix_handler(store, path.clone())?, path))
             }
             "file" => {
-                let store = Arc::new(LocalFileSystem::new_with_prefix(
-                    url.to_file_path().unwrap(),
-                )?) as ObjectStoreRef;
-                Ok((store, Path::from("/")))
+                // If there is allow_unsafe_rename in the option, use FileStorageBackend,
+                // because LocalFileSystem uses hard link and does not support cross file system
+                let ops = FileStorageOptions::from_map(&_options.0);
+                if ops.allow_unsafe_rename {
+                    let store = Arc::new(FileStorageBackend::try_new(
+                        url.to_file_path().unwrap(),
+                        ops,
+                    )?) as ObjectStoreRef;
+                    Ok((store, Path::from("/")))
+                } else {
+                    let store = Arc::new(LocalFileSystem::new_with_prefix(
+                        url.to_file_path().unwrap(),
+                    )?) as ObjectStoreRef;
+                    Ok((store, Path::from("/")))
+                }
             }
             _ => Err(DeltaTableError::InvalidTableLocation(url.clone().into())),
         }

@@ -483,6 +483,11 @@ to append pass in ``mode='append'``:
 the data passed to it differs from the existing table's schema. If you wish to
 alter the schema as part of an overwrite pass in ``overwrite_schema=True``.
 
+.. note::
+    if the local file system does not support hard links, such as blobfuse,
+    s3fs-fuse, you can choose to set the `FILE_ALLOW_UNSAFE_RENAME` variable
+    to ``true`` in order to enable unsafe writes.
+
 Writing to s3
 ~~~~~~~~~~~~~
 

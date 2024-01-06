@@ -2,6 +2,7 @@
 //!
 //! The local file storage backend is multi-writer safe.
 
+use super::str_is_truthy;
 use bytes::Bytes;
 use futures::stream::BoxStream;
 use object_store::{
@@ -9,6 +10,7 @@ use object_store::{
     GetResult, ListResult, MultipartId, ObjectMeta, ObjectStore, PutOptions, PutResult,
     Result as ObjectStoreResult,
 };
+use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 use tokio::io::AsyncWrite;
@@ -103,6 +105,48 @@ impl From<LocalFileSystemError> for ObjectStoreError {
     }
 }
 
+/// Storage option keys to use when creating [crate::storage::file::FileStorageOptions].
+/// The same key should be used whether passing a key in the hashmap or setting it as an environment variable.
+pub mod file_constants {
+    /// If set to "true", allows creating commits without concurrent writer protection.
+    /// Only safe if there is one writer to a given table.
+    pub const FILE_ALLOW_UNSAFE_RENAME: &str = "FILE_ALLOW_UNSAFE_RENAME";
+
+    /// The list of option keys owned by the File module.
+    /// Option keys not contained in this list will be added to the `extra_opts`
+    /// field of [crate::storage::file::FileStorageOptions].
+    pub const FILE_OPTS: &[&str] = &[FILE_ALLOW_UNSAFE_RENAME];
+}
+
+/// Options used to configure the FileStorageBackend.
+///
+/// Available options are described in [file_constants].
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(missing_docs)]
+pub struct FileStorageOptions {
+    pub allow_unsafe_rename: bool,
+}
+
+impl FileStorageOptions {
+    /// Creates an instance of FileStorageOptions from the given HashMap.
+    pub fn from_map(options: &HashMap<String, String>) -> FileStorageOptions {
+        let allow_unsafe_rename = str_option(options, file_constants::FILE_ALLOW_UNSAFE_RENAME)
+            .map(|val| str_is_truthy(&val))
+            .unwrap_or(false);
+
+        Self {
+            allow_unsafe_rename,
+        }
+    }
+}
+
+impl Default for FileStorageOptions {
+    /// Creates an instance of FileStorageOptions from environment variables.
+    fn default() -> FileStorageOptions {
+        Self::from_map(&HashMap::new())
+    }
+}
+
 /// Multi-writer support for different platforms:
 ///
 /// * Modern Linux kernels are well supported. However because Linux implementation leverages
@@ -119,14 +163,20 @@ impl From<LocalFileSystemError> for ObjectStoreError {
 pub struct FileStorageBackend {
     inner: Arc<LocalFileSystem>,
     root_url: Arc<Url>,
+    /// Whether allowed to performance rename_if_not_exist as rename
+    allow_unsafe_rename: bool,
 }
 
 impl FileStorageBackend {
     /// Creates a new FileStorageBackend.
-    pub fn try_new(path: impl AsRef<std::path::Path>) -> ObjectStoreResult<Self> {
+    pub fn try_new(
+        path: impl AsRef<std::path::Path>,
+        options: FileStorageOptions,
+    ) -> ObjectStoreResult<Self> {
         Ok(Self {
             root_url: Arc::new(Self::path_to_root_url(path.as_ref())?),
             inner: Arc::new(LocalFileSystem::new_with_prefix(path)?),
+            allow_unsafe_rename: options.allow_unsafe_rename,
         })
     }
 
@@ -248,7 +298,11 @@ impl ObjectStore for FileStorageBackend {
     ) -> ObjectStoreResult<()> {
         let path_from = self.path_to_filesystem(from);
         let path_to = self.path_to_filesystem(to);
-        Ok(rename_noreplace(path_from.as_ref(), path_to.as_ref()).await?)
+        if self.allow_unsafe_rename {
+            Ok(regular_rename(path_from.as_ref(), path_to.as_ref()).await?)
+        } else {
+            Ok(rename_noreplace(path_from.as_ref(), path_to.as_ref()).await?)
+        }
     }
 
     async fn put_multipart(
@@ -272,6 +326,15 @@ impl ObjectStore for FileStorageBackend {
 #[inline]
 async fn rename_noreplace(from: &str, to: &str) -> Result<(), LocalFileSystemError> {
     imp::rename_noreplace(from, to).await
+}
+
+/// Regular renames `from` to `to`.
+/// `from` has to exist, but `to` is not, otherwise the operation will fail.
+/// If the filesystem(such as blobfuse,goofys,s3fs) does not support hard links,
+/// you can set the FILE_ALLOW_UNSAFE_RENAME to true to use regular rename.
+#[inline]
+async fn regular_rename(from: &str, to: &str) -> Result<(), LocalFileSystemError> {
+    imp::regular_rename(from, to).await
 }
 
 // Generic implementation (Requires 2 system calls)
@@ -312,6 +375,40 @@ mod imp {
             })?;
 
             Ok(())
+        })
+        .await
+        .unwrap()
+    }
+
+    pub(super) async fn regular_rename(from: &str, to: &str) -> Result<(), LocalFileSystemError> {
+        let from_path = String::from(from);
+        let to_path = String::from(to);
+
+        tokio::task::spawn_blocking(move || {
+            if std::fs::metadata(&to_path).is_ok() {
+                Err(LocalFileSystemError::AlreadyExists {
+                    path: to_path,
+                    source: Box::new(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        "Already exists",
+                    )),
+                })
+            } else {
+                std::fs::rename(&from_path, &to_path).map_err(|err| {
+                    if err.kind() == std::io::ErrorKind::NotFound {
+                        LocalFileSystemError::NotFound {
+                            path: from_path.clone(),
+                            source: Box::new(err),
+                        }
+                    } else {
+                        LocalFileSystemError::Generic {
+                            store: STORE_NAME,
+                            source: Box::new(err),
+                        }
+                    }
+                })?;
+                Ok(())
+            }
         })
         .await
         .unwrap()
@@ -375,6 +472,10 @@ mod imp {
         }
     }
 
+    pub(super) async fn regular_rename(from: &str, to: &str) -> Result<(), LocalFileSystemError> {
+        rename_noreplace(from, to).await
+    }
+
     #[allow(unused_variables)]
     unsafe fn platform_specific_rename(from: *const libc::c_char, to: *const libc::c_char) -> i32 {
         cfg_if::cfg_if! {
@@ -387,6 +488,11 @@ mod imp {
             }
         }
     }
+}
+
+pub(crate) fn str_option(map: &HashMap<String, String>, key: &str) -> Option<String> {
+    map.get(key)
+        .map_or_else(|| std::env::var(key).ok(), |v| Some(v.to_owned()))
 }
 
 #[cfg(test)]
