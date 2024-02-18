@@ -68,3 +68,7 @@ In this case, you can use a `predicate` to overwrite only the relevant records o
     otherwise the operation will fail 
 
 {{ code_example('operations', 'replace_where', ['replaceWhere'])}}
+
+## Enable unsafe writes in local file system (opt-in)
+
+If the local file system does not support hard links, such as blobfuse, s3fs-fuse, you can choose to set the `FILE_ALLOW_UNSAFE_RENAME` variable to ``true`` in order to enable unsafe writes.
